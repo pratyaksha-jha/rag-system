@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Retriever</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body class="bg-linear-to-br from-slate-50 to-slate-100 min-h-screen">
+  <div id="app" class="p-6 max-w-7xl mx-auto"></div>
+
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    const state = {
+      documents: [],
+      uploadedFiles: [],
+      extractionErrors: [],
+      query: '',
+      result: null,
+      activeTab: 'answer',
+      showUploadModal: true,
+      isExtracting: false,
+      processing: false
+    };
+
+    // Extract text from files
+    async function extractTextFromFile(file) {
+      const fileType = file.type || '';
+      const fileName = file.name.toLowerCase();
+
+      if (fileType === 'application/pdf' || fileName.endsWith('.pdf')) {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+        let fullText = '';
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map(item => item.str).join(' ');
+          fullText += pageText + '\n\n';
+        }
+        return fullText.trim();
+      } else if (
+        fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+        fileType === 'application/msword' ||
+        fileName.endsWith('.docx') ||
+        fileName.endsWith('.doc')
+      ) {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        return result.value;
+      } else {
+        const text = await file.text();
+        if (fileType === 'application/json' || fileName.endsWith('.json')) {
+          try {
+            const json = JSON.parse(text);
+            return JSON.stringify(json, null, 2);
+          } catch {
+            return text;
+          }
+        }
+        return text;
+      }
+    }
+
+    // File upload handler
+    async function handleFileUpload(files) {
+      state.isExtracting = true;
+      state.extractionErrors = [];
+      render();
+
+      for (const file of files) {
+        try {
+          const text = await extractTextFromFile(file);
+          if (text && text.trim().length > 0) {
+            state.uploadedFiles.push({
+              name: file.name,
+              size: file.size,
+              type: file.type,
+              content: text
+            });
+          } else {
+            state.extractionErrors.push(`${file.name}: No text content extracted`);
+          }
+        } catch (error) {
+          state.extractionErrors.push(`${file.name}: ${error.message}`);
+        }
+      }
+
+      state.isExtracting = false;
+      render();
+    }
+    function chunkText(text, chunkSize = 400, overlap = 50) {
+  const words = text.split(/\s+/);
+  const chunks = [];
+
+  for (let i = 0; i < words.length; i += chunkSize - overlap) {
+    chunks.push(words.slice(i, i + chunkSize).join(' '));
+  }
+
+  return chunks;
+}
+
+    // Process uploaded files
+    function processUploadedFiles() {
+  let docId = Date.now();
+  state.documents = [];
+
+  state.uploadedFiles.forEach(file => {
+    const chunks = chunkText(file.content);
+    chunks.forEach((chunk, i) => {
+      state.documents.push({
+        id: docId++,
+        title: `${file.name} (chunk ${i + 1})`,
+        content: chunk,
+        source: file.name
+      });
+    });
+  });
+
+  state.uploadedFiles = [];
+  state.showUploadModal = false; 
+  render();
+}
+   // Load sample documents
+    function loadSampleDocuments() {
+      state.documents = [
+        {
+          id: 1,
+          title: "Climate Change Report 2024",
+          content: "Global temperatures have risen by 1.2°C since pre-industrial times. The Paris Agreement aims to limit warming to 1.5°C. Carbon emissions from fossil fuels are the primary driver. Renewable energy adoption has increased by 45% in the past decade. Scientists warn that sea levels could rise by 2 meters by 2100."
+        },
+        {
+          id: 2,
+          title: "Renewable Energy Progress",
+          content: "Solar and wind energy now account for 12% of global electricity generation. The cost of solar panels has decreased by 89% since 2010. However, some studies suggest renewable transition may take longer than expected. Battery storage technology is crucial for grid stability. China leads in renewable energy investment with $380 billion annually."
+        },
+        {
+          id: 3,
+          title: "Economic Impact Study",
+          content: "Transitioning to renewable energy could create 24 million jobs by 2030. Fossil fuel industries employ approximately 11 million workers globally. The economic cost of climate inaction is estimated at $23 trillion by 2050. Green bonds have reached $500 billion in issuance. Some economists argue the transition costs are underestimated."
+        }
+      ];
+      state.showUploadModal = false;
+      render();
+    }
+
+    // Calculate relevance
+    function calculateRelevance(query, document) {
+  const qTerms = query.toLowerCase().split(/\s+/);
+  const docText = document.content.toLowerCase();
+
+  let score = 0;
+
+  qTerms.forEach(term => {
+    if (term.length < 3) return;
+
+    const matches = docText.match(new RegExp(`\\b${term}\\b`, 'g')) || [];
+    score += matches.length * 2;
+  });
+
+  // boost factual sentences
+  if (docText.match(/\d+/)) score += 1;
+
+  return score;
+}
+
+
+    // Extract entities
+    function extractEntities(text) {
+  const entities = [];
+
+  // Metrics
+  const metrics = text.match(/\b\d+(\.\d+)?\s?(%|°C|million|billion|trillion|meters)\b/g) || [];
+  metrics.forEach(m => entities.push({ text: m, type: 'METRIC' }));
+
+  // Named entities
+  const names = text.match(/\b[A-Z][a-z]+(?:\s[A-Z][a-z]+){0,2}\b/g) || [];
+  names.forEach(n => {
+    if (n.length > 4) entities.push({ text: n, type: 'ENTITY' });
+  });
+
+  return entities;
+}
+    function generateMockQuestions(documents) {
+  const questions = new Set();
+
+  documents.forEach(doc => {
+    const text = doc.content;
+
+    if (text.match(/cost|price|economic/i))
+      questions.add("What is the economic impact discussed in the documents?");
+
+    if (text.match(/increase|rise|growth/i))
+      questions.add("What trends or increases are mentioned?");
+
+    if (text.match(/\d+/))
+      questions.add("What key statistics are reported?");
+
+    if (text.match(/renewable|energy/i))
+      questions.add("What does the document say about renewable energy?");
+  });
+
+  return Array.from(questions).slice(0, 5);
+}
+// Highlight relevant passages
+    function highlightRelevantPassages(document, entities, query) {
+      const highlights = [];
+      const sentences = document.content.split(/\.\s+/);
+
+      sentences.forEach((sentence, idx) => {
+        let relevance = 0;
+        entities.forEach(entity => {
+          if (sentence.includes(entity.text)) relevance++;
+        });
+        query.split(/\s+/).forEach(term => {
+          if (sentence.toLowerCase().includes(term.toLowerCase())) relevance++;
+        });
+
+        if (relevance > 0) {
+          highlights.push({ sentence: sentence + '.', relevance, position: idx });
+        }
+      });
+
+      return highlights.sort((a, b) => b.relevance - a.relevance);
+    }
+// Generate answer
+    function generateAnswer(query, retrievedDocs) {
+  const sentences = [];
+
+  retrievedDocs.forEach(doc => {
+    doc.content.split(/\. /).forEach(s => {
+      if (
+        query.toLowerCase().split(/\s+/).some(q => 
+          s.toLowerCase().includes(q)
+        )
+      ) {
+        sentences.push(s.trim() + '.');
+      }
+    });
+  });
+
+  if (sentences.length === 0) return null;
+
+  return sentences.slice(0, 4).join(' ');
+}
+// Process query
+    async function processQuery() {
+      if (!state.query.trim()) return;
+
+      state.processing = true;
+      state.result = null;
+      render();
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      const scoredDocs = state.documents.map(doc => ({
+        ...doc,
+        relevance: calculateRelevance(state.query, doc)
+      })).sort((a, b) => b.relevance - a.relevance);
+
+      const retrievedDocs = scoredDocs.slice(0, 3).filter(d => d.relevance > 0);
+
+      if (retrievedDocs.length === 0) {
+        state.result = { noAnswerFound: true, retrievedDocs: [], entities: [], highlights: {} };
+        state.processing = false;
+        render();
+        return;
+      }
+      const mockQuestions = generateMockQuestions(retrievedDocs);
+
+      const allEntities = retrievedDocs.flatMap(doc => extractEntities(doc.content));
+      const uniqueEntities = Array.from(new Map(allEntities.map(e => [e.text, e])).values());
+
+      const answer = generateAnswer(state.query, retrievedDocs, uniqueEntities);
+
+      if (!answer) {
+        state.result = { noAnswerFound: true, retrievedDocs, entities: uniqueEntities, highlights: {} };
+        state.processing = false;
+        render();
+        return;
+      }
+
+      const highlights = {};
+      retrievedDocs.forEach(doc => {
+        highlights[doc.id] = highlightRelevantPassages(doc, uniqueEntities, state.query);
+      });
+
+      state.result = {
+        answer,
+        noAnswerFound: false,
+        entities: uniqueEntities,
+        retrievedDocs,
+        highlights,
+        mockQuestions
+      };
+
+      state.processing = false;
+      render();
+    }
+// Render function
+    function render() {
+      const app = document.getElementById('app');
+
+      app.innerHTML = `
+        ${state.showUploadModal ? `
+          <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+              <div class="p-6 border-b border-slate-200">
+                <div class="flex items-center justify-between">
+                  <div>
+                    <h2 class="text-2xl font-bold text-slate-800">Upload Documents</h2>
+                    <p class="text-slate-600 mt-1">Add documents to your knowledge base</p>
+                  </div>
+                  ${state.documents.length > 0 ? `
+                    <button onclick="state.showUploadModal = false; render();" class="p-2 hover:bg-slate-100 rounded-lg">
+                      ✕
+                    </button>
+                  ` : ''}
+                </div>
+              </div>
+
+              <div class="p-6">
+                <div class="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center hover:border-blue-400 transition-colors bg-slate-50">
+                  <input type="file" multiple accept=".txt,.json,.md,.csv,.pdf,.doc,.docx"
+                    onchange="handleFileUpload(Array.from(this.files))" id="file-upload" class="hidden">
+                  <label for="file-upload" class="cursor-pointer block">
+                    <div class="text-6xl mb-3">📤</div>
+                    <p class="text-slate-700 font-medium mb-1">Click to upload or drag and drop</p>
+                    <p class="text-sm text-slate-500">PDF, DOC, DOCX, TXT, JSON, MD, CSV files supported</p>
+                  </label>
+                </div>
+
+                ${state.extractionErrors.length > 0 ? `
+                  <div class="mt-4 bg-red-50 border border-red-200 rounded-lg p-3">
+                    <p class="font-semibold text-red-900 text-sm mb-1">Extraction Errors:</p>
+                    ${state.extractionErrors.map(err => `<p class="text-sm text-red-800">• ${err}</p>`).join('')}
+                  </div>
+                ` : ''}
+
+                ${state.uploadedFiles.length > 0 ? `
+                  <div class="mt-6">
+                    <h3 class="font-semibold text-slate-800 mb-3">Uploaded Files (${state.uploadedFiles.length})</h3>
+                    <div class="space-y-2 max-h-60 overflow-y-auto">
+                      ${state.uploadedFiles.map((file, idx) => `
+                        <div class="flex items-center justify-between bg-white p-3 rounded-lg border border-slate-200">
+                          <div class="flex items-center gap-3 flex-1">
+                            <span class="text-2xl">📄</span>
+                            <div>
+                              <p class="font-medium text-slate-800">${file.name}</p>
+                              <p class="text-sm text-slate-500">${(file.size / 1024).toFixed(1)} KB</p>
+                            </div>
+                          </div>
+                          <button onclick="state.uploadedFiles.splice(${idx}, 1); render();"
+                            class="p-1 hover:bg-red-50 rounded">✕</button>
+                        </div>
+                      `).join('')}
+                    </div>
+                  </div>
+                ` : ''}
+
+                ${state.isExtracting ? `
+                  <div class="mt-4 flex items-center justify-center gap-2 text-blue-600">
+                    <div class="animate-spin text-2xl">⚙️</div>
+                    <span>Processing files...</span>
+                  </div>
+                ` : ''}
+
+                <div class="mt-6">
+                  <button onclick="processUploadedFiles()" ${state.uploadedFiles.length === 0 ? 'disabled' : ''}
+                    class="w-full px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed font-medium">
+                    Add ${state.uploadedFiles.length} Document${state.uploadedFiles.length !== 1 ? 's' : ''} to Knowledge Base
+                  </button>
+                </div>
+
+                <div class="relative my-6">
+                  <div class="absolute inset-0 flex items-center"><div class="w-full border-t border-slate-300"></div></div>
+                  <div class="relative flex justify-center text-sm"><span class="px-4 bg-white text-slate-500">or</span></div>
+                </div>
+
+                <button onclick="loadSampleDocuments()"
+                  class="w-full px-6 py-3 border-2 border-slate-300 text-slate-700 rounded-lg hover:bg-slate-50 font-medium">
+                  Load Sample Documents (Climate & Energy)
+                </button>
+              </div>
+            </div>
+          </div>
+        ` : ''}
+
+        <div class="bg-white rounded-2xl shadow-lg p-8 mb-6">
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h1 class="text-4xl font-bold text-slate-800 mb-2">Retriever.</h1>
+              <p class="text-slate-600">Transparent retrieval-augmented generation with structured explanations</p>
+              ${state.documents.length > 0 ? `
+                <p class="text-sm text-blue-600 mt-2">${state.documents.length} document${state.documents.length !== 1 ? 's' : ''} in knowledge base</p>
+              ` : ''}
+            </div>
+            <div class="flex items-center gap-3">
+              <button onclick="state.showUploadModal = true; render();"
+                class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 flex items-center gap-2">
+                ➕ Add Documents
+              </button>
+              <span class="text-5xl">🔗</span>
+            </div>
+          </div>
+
+          ${state.documents.length > 0 ? `
+            <div class="mt-6 bg-slate-50 rounded-lg p-4">
+              <div class="flex items-center justify-between mb-3">
+                <h3 class="font-semibold text-slate-800">Knowledge Base</h3>
+                <button onclick="state.documents = []; state.result = null; render();"
+                  class="text-sm text-red-600 hover:text-red-700">Clear All</button>
+              </div>
+              <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-3 max-h-40 overflow-y-auto">
+                ${state.documents.map(doc => `
+                  <div class="bg-white p-3 rounded-lg border border-slate-200 flex items-start justify-between">
+                    <div class="flex items-start gap-2 flex-1">
+                      <span class="text-xl">📄</span>
+                      <div>
+                        <p class="font-medium text-slate-800 text-sm">${doc.title}</p>
+                        <p class="text-xs text-slate-500">${doc.content.length} chars</p>
+                      </div>
+                    </div>
+                    <button onclick="state.documents = state.documents.filter(d => d.id !== ${doc.id}); state.result = null; render();"
+                      class="p-1 hover:bg-red-50 rounded">✕</button>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+
+            <div class="mt-6">
+              <div class="flex gap-3 mb-3">
+                <input type="text" value="${state.query}"
+                  oninput="state.query = this.value"
+                  onkeypress="if(event.key === 'Enter') processQuery()"
+                  placeholder="Ask a question about your documents..."
+                  class="flex-1 px-4 py-3 border-2 border-slate-200 rounded-lg focus:outline-none focus:border-blue-500">
+                <button onclick="processQuery()" ${state.processing || !state.query.trim() ? 'disabled' : ''}
+                  class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed flex items-center gap-2">
+                  ${state.processing ? 'Processing' : 'Search'}
+                </button>
+              </div>
+            </div>
+          ` : ''}
+        </div>
+
+        ${state.result ? `
+          <div class="bg-white rounded-2xl shadow-lg p-6">
+            <div class="mb-6">
+              <div class="flex border-b border-slate-200">
+                <button onclick="state.activeTab = 'answer'; render();"
+                  class="flex-1 px-6 py-4 ${state.activeTab === 'answer' ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600' : 'text-slate-600 hover:bg-slate-50'}">
+                  Answer & Evidence
+                </button>
+                <button onclick="state.activeTab = 'documents'; render();"
+                  class="flex-1 px-6 py-4 ${state.activeTab === 'documents' ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600' : 'text-slate-600 hover:bg-slate-50'}">
+                    Source Documents
+                </button>
+              </div>
+            </div>
+
+            ${state.activeTab === 'answer' ? `
+              ${state.result.noAnswerFound ? `
+                <div class="bg-amber-50 border-2 border-amber-300 rounded-xl p-6">
+                  <div class="flex items-start gap-3">
+                    <span class="text-4xl">⚠️</span>
+                    <div>
+                      <h2 class="text-xl font-bold text-amber-900 mb-2">Answer Not Found in Documents</h2>
+                      <p class="text-amber-800">The system searched through all uploaded documents but could not find relevant information to answer your query: "<span class="font-semibold">${state.query}</span>"</p>
+                      <p class="text-amber-800 mt-3">Suggestions:</p>
+                      <ul class="list-disc list-inside text-amber-800 mt-1 space-y-1">
+                        <li>Try rephrasing your question</li>
+                        <li>Upload additional documents that may contain the answer</li>
+                        <li>Check if your question relates to the content in your documents</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              ` : `
+                <div class="space-y-6">
+                  <div>
+                    <h2 class="text-2xl font-bold text-slate-800 mb-4">Generated Answer</h2>
+                    <div class="bg-blue-50 border-l-4 border-blue-600 p-4 rounded-r-lg">
+                      <p class="text-slate-800 leading-relaxed">${state.result.answer}</p>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-2">✓ Answer extracted directly from uploaded documents</p>
+                  </div>
+
+                  <div>
+                    <h3 class="text-xl font-bold text-slate-800 mb-3">Extracted Entities</h3>
+                    <div class="flex flex-wrap gap-2">
+                      ${state.result.entities.map(entity => {
+                        const colors = {
+                          METRIC: 'bg-blue-100 text-blue-800 border-blue-300',
+                          ENTITY: 'bg-green-100 text-green-800 border-green-300',
+                          CONCEPT: 'bg-amber-100 text-amber-800 border-amber-300'
+                        };
+                        return `<span class="px-3 py-1 rounded-full border-2 text-sm font-medium ${colors[entity.type]}">${entity.text}</span>`;
+                      }).join('')}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 class="text-xl font-bold text-slate-800 mb-3">Evidence from Retrieved Documents</h3>
+                    ${state.result.retrievedDocs.map(doc => `
+                      <div class="mb-4 bg-slate-50 rounded-lg p-4">
+                        <h4 class="font-semibold text-slate-700 mb-2 flex items-center gap-2">
+                          📄 ${doc.title}
+                          <span class="text-sm font-normal text-slate-500">(Relevance: ${doc.relevance})</span>
+                        </h4>
+                        ${state.result.highlights[doc.id] && state.result.highlights[doc.id].length > 0 ? `
+                          <div class="space-y-2">
+                            ${state.result.highlights[doc.id].slice(0, 3).map(h => `
+                              <div class="bg-yellow-100 border-l-4 border-yellow-500 p-2 text-sm">
+                                <span class="text-slate-700">${h.sentence}</span>
+                              </div>
+                            `).join('')}
+                          </div>
+                        ` : ''}
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              `}
+            ` : ''}
+
+            ${state.activeTab === 'documents' ? `
+              <div>
+                <h2 class="text-2xl font-bold text-slate-800 mb-4">Source Documents</h2>
+                <div class="space-y-4">
+                  ${state.result.retrievedDocs.map(doc => `
+                    <div class="bg-slate-50 rounded-lg p-4">
+                      <div class="flex items-start justify-between mb-3">
+                        <h3 class="font-semibold text-slate-800">${doc.title}</h3>
+                        <span class="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm">Score: ${doc.relevance}</span>
+                      </div>
+                      <p class="text-slate-700 leading-relaxed">${doc.content}</p>
+                    </div>
+                  `).join('')}
+                </div>
+              </div>
+            ` : ''}
+          </div>
+        ` : ''}
+
+        ${!state.result && !state.processing && state.documents.length === 0 ? `
+          <div class="bg-white rounded-2xl shadow-lg p-12 text-center">
+            <div class="text-6xl mb-4">📤</div>
+            <h3 class="text-xl font-semibold text-slate-700 mb-2">No Documents Yet</h3>
+            <p class="text-slate-500 mb-4">Upload documents or load sample data to get started</p>
+            <button onclick="state.showUploadModal = true; render();"
+              class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Upload Documents</button>
+          </div>
+        ` : ''}
+
+        ${!state.result && !state.processing && state.documents.length > 0 ? `
+          <div class="bg-white rounded-2xl shadow-lg p-12 text-center">
+            <div class="text-6xl mb-4">🔗</div>
+            <h3 class="text-xl font-semibold text-slate-700 mb-2">Ready to Explain</h3>
+            <p class="text-slate-500">Ask a question to see transparent RAG in action with structured explanations</p>
+          </div>
+        ` : ''}
+      `;
+    }
+
+    render();
+  </script>
+</body>
+</html>
