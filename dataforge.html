@@ -8,13 +8,12 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    body { font-family: system-ui, -apple-system, sans-serif; }
-    .hidden { display: none; }
+    body {font-family:Arial, Helvetica, sans-serif; }
+    .hidden {display: none;}
   </style>
 </head>
 <body class="bg-linear-to-br from-slate-50 to-slate-100 min-h-screen">
   <div id="app" class="p-6 max-w-7xl mx-auto"></div>
-
   <script>
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
@@ -29,8 +28,27 @@
       isExtracting: false,
       processing: false
     };
+    function removeDiagramText(rawText) {
+  return rawText
+    .split('\n')
+    .filter(line => {
+      const l = line.trim();
+      if (!l) return false;
+      if (/^(figure|fig\.?|diagram|table)\s*\d+/i.test(l)) return false;
+      const hasMetadata = /(\.indb|\.pdf|\d{2}[-\/]\d{2}[-\/]\d{4}|\d{2}:\d{2}:\d{2})/i.test(l);
+      if (hasMetadata) return false;
 
-    // Extract text from files
+      if (/^(page|pg\.?)\s*\d+/i.test(l) || /^\d+\s*of\s*\d+$/i.test(l)) return false;
+      if (l.length < 20) return false;
+      const alphaChars = l.match(/[a-zA-Z]/g) || [];
+      const alphaRatio = alphaChars.length / l.length;
+      if (alphaRatio < 0.4) return false;
+
+      return true;
+    })
+    .join('\n');
+}
+
     async function extractTextFromFile(file) {
       const fileType = file.type || '';
       const fileName = file.name.toLowerCase();
@@ -45,17 +63,22 @@
           const pageText = textContent.items.map(item => item.str).join(' ');
           fullText += pageText + '\n\n';
         }
-        return fullText.trim();
-      } else if (
+        return removeDiagramText(fullText.trim());
+
+      }
+      else if (
         fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
         fileType === 'application/msword' ||
         fileName.endsWith('.docx') ||
         fileName.endsWith('.doc')
-      ) {
+      )
+      {
         const arrayBuffer = await file.arrayBuffer();
         const result = await mammoth.extractRawText({ arrayBuffer });
-        return result.value;
-      } else {
+        return removeDiagramText(result.value);
+
+      }
+      else {
         const text = await file.text();
         if (fileType === 'application/json' || fileName.endsWith('.json')) {
           try {
@@ -65,7 +88,7 @@
             return text;
           }
         }
-        return text;
+    return removeDiagramText(text);
       }
     }
 
@@ -153,23 +176,40 @@
 
     // Calculate relevance
     function calculateRelevance(query, document) {
-  const qTerms = query.toLowerCase().split(/\s+/);
+  const qTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const docText = document.content.toLowerCase();
 
+  if (qTerms.length === 0) return 0;
+
   let score = 0;
+  let matchedTerms = 0;
 
   qTerms.forEach(term => {
-    if (term.length < 3) return;
-
     const matches = docText.match(new RegExp(`\\b${term}\\b`, 'g')) || [];
-    score += matches.length * 2;
+    if (matches.length > 0) matchedTerms++;
+
+    // TF component
+    score += matches.length;
   });
 
-  // boost factual sentences
-  if (docText.match(/\d+/)) score += 1;
+  // Phrase boost
+  if (docText.includes(query.toLowerCase())) {
+    score += 5;
+  }
 
-  return score;
+  // Query coverage boost (how many query terms appear)
+  score += matchedTerms * 2;
+
+  // Length normalization
+  const lengthPenalty = Math.log(document.content.length + 1);
+  score = score / lengthPenalty;
+
+  // Numeric / factual boost
+  if (/\d/.test(docText)) score += 1;
+
+  return Math.round(score * 10) / 10;
 }
+
 
 
     // Extract entities
@@ -311,7 +351,7 @@
       app.innerHTML = `
         ${state.showUploadModal ? `
           <div class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-            <div class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div class="bg-[#EDEDE9] rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
               <div class="p-6 border-b border-slate-200">
                 <div class="flex items-center justify-between">
                   <div>
@@ -327,7 +367,7 @@
               </div>
 
               <div class="p-6">
-                <div class="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center hover:border-blue-400 transition-colors bg-slate-50">
+                <div class="border-2 border-slate-300 rounded-xl p-8 text-center hover:border-[#000000] transition-colors bg-[#E3D5CA]">
                   <input type="file" multiple accept=".txt,.json,.md,.csv,.pdf,.doc,.docx"
                     onchange="handleFileUpload(Array.from(this.files))" id="file-upload" class="hidden">
                   <label for="file-upload" class="cursor-pointer block">
@@ -374,7 +414,7 @@
 
                 <div class="mt-6">
                   <button onclick="processUploadedFiles()" ${state.uploadedFiles.length === 0 ? 'disabled' : ''}
-                    class="w-full px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed font-medium">
+                    class="w-full px-6 py-3 bg-[#E3D5CA] text-black rounded-lg hover:bg- [#E3D5CA]disabled:bg-slate-300 disabled:cursor-not-allowed font-medium">
                     Add ${state.uploadedFiles.length} Document${state.uploadedFiles.length !== 1 ? 's' : ''} to Knowledge Base
                   </button>
                 </div>
@@ -385,15 +425,15 @@
                 </div>
 
                 <button onclick="loadSampleDocuments()"
-                  class="w-full px-6 py-3 border-2 border-slate-300 text-slate-700 rounded-lg hover:bg-slate-50 font-medium">
-                  Load Sample Documents (Climate & Energy)
+                  class="w-full px-6 py-3 border-2 border-slate-300 text-slate-700 rounded-lg hover:bg-[#E3D5CA] font-medium">
+                  Load Sample Documents
                 </button>
               </div>
             </div>
           </div>
         ` : ''}
 
-        <div class="bg-white rounded-2xl shadow-lg p-8 mb-6">
+        <section class="mb-10">
           <div class="flex items-center justify-between mb-4">
             <div>
               <h1 class="text-4xl font-bold text-slate-800 mb-2">Retriever.</h1>
@@ -405,14 +445,13 @@
             <div class="flex items-center gap-3">
               <button onclick="state.showUploadModal = true; render();"
                 class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 flex items-center gap-2">
-                ➕ Add Documents
+                Add Documents
               </button>
-              <span class="text-5xl">🔗</span>
             </div>
           </div>
 
           ${state.documents.length > 0 ? `
-            <div class="mt-6 bg-slate-50 rounded-lg p-4">
+            <div class="mt-6 bg-[#EDEDE9] rounded-lg p-4">
               <div class="flex items-center justify-between mb-3">
                 <h3 class="font-semibold text-slate-800">Knowledge Base</h3>
                 <button onclick="state.documents = []; state.result = null; render();"
@@ -456,11 +495,11 @@
             <div class="mb-6">
               <div class="flex border-b border-slate-200">
                 <button onclick="state.activeTab = 'answer'; render();"
-                  class="flex-1 px-6 py-4 ${state.activeTab === 'answer' ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600' : 'text-slate-600 hover:bg-slate-50'}">
+                  class="flex-1 px-6 py-4 ${state.activeTab === 'answer' ? 'bg-[#CFB595] text- border-b-2 border-[#412920]' : 'text-[#3D2D13] hover:bg-slate-50'}">
                   Answer & Evidence
                 </button>
                 <button onclick="state.activeTab = 'documents'; render();"
-                  class="flex-1 px-6 py-4 ${state.activeTab === 'documents' ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600' : 'text-slate-600 hover:bg-slate-50'}">
+                  class="flex-1 px-6 py-4 ${state.activeTab === 'documents' ? 'bg-[#CFB595] text- border-b-2 border-[#412920]' : 'text-[#3D2D13] hover:bg-slate-50'}">
                     Source Documents
                 </button>
               </div>
@@ -487,7 +526,7 @@
                 <div class="space-y-6">
                   <div>
                     <h2 class="text-2xl font-bold text-slate-800 mb-4">Generated Answer</h2>
-                    <div class="bg-blue-50 border-l-4 border-blue-600 p-4 rounded-r-lg">
+                    <div class="bg-[#EDEDE9] p-4 rounded-r-lg">
                       <p class="text-slate-800 leading-relaxed">${state.result.answer}</p>
                     </div>
                     <p class="text-xs text-slate-500 mt-2">✓ Answer extracted directly from uploaded documents</p>
@@ -561,8 +600,7 @@
         ` : ''}
 
         ${!state.result && !state.processing && state.documents.length > 0 ? `
-          <div class="bg-white rounded-2xl shadow-lg p-12 text-center">
-            <div class="text-6xl mb-4">🔗</div>
+          <div class="bg-[#EDEDE9] p-12 text-center">
             <h3 class="text-xl font-semibold text-slate-700 mb-2">Ready to Explain</h3>
             <p class="text-slate-500">Ask a question to see transparent RAG in action with structured explanations</p>
           </div>
